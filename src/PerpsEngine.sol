@@ -6,6 +6,10 @@ import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import {ERC20} from '@openzeppelin/contracts/token/ERC20/ERC20.sol';
 import {LiquidityPool} from "./LiquidityPool.sol";
 import {AggregatorV3Interface} from "lib/chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {SignedMath} from "@openzeppelin/contracts/utils/math/SignedMath.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 contract PerpsEngine is LiquidityPool {
     // Errors
@@ -18,183 +22,144 @@ contract PerpsEngine is LiquidityPool {
     error PerpsEngine_MaxLeverageExceeded(uint256 leverage, uint256 maxLeverage);
     error PerpsEngine_MinLeverageNotMet(uint256 leverage, uint256 minLeverage);
 
+    using SafeCast for int256;
+    using SafeCast for uint256;
+    using SignedMath for int256;
+    using SafeERC20 for IERC20;
+
     // State Variables
     struct Position {
-        int256 size; // Positive for long, negative for short
-        uint256 collateral; // Collateral in asset tokens
-        uint256 entryPrice; // Price at which position was opened
+        uint256 sizeInUSD;
+        uint256 sizeInTokens;
+        uint256 collateralAmount;
+        uint256 lastUpdatedAt;
     }
 
-    uint256 public constant MAX_UTILIZATION = 800; // 80%
-    uint256 public constant UTILIZATION_PRECISION = 1000;
-    uint256 public constant MAX_POSITION_LIQUIDITY = 200; // 20%
-    uint256 public constant MAX_LEVERAGE = 15e18; // 15x
-    uint256 public constant MIN_LEVERAGE = 1e18; // 1x
-    uint256 public constant MIN_NOTIONAL_VALUE = 1e18; // $1 in 1e18 precision
-    uint256 public constant PRICE_PRECISION = 1e18;
+    address public indexToken;
+    address public btcPriceFeed;
 
-    uint256 public shortsOpenInterest; // In USD, 1e18 precision
-    uint256 public longsOpenInterestInTokens; // In BTC tokens
-    uint256 public reservedLiquidity; // Total collateral locked
-    address public immutable wbtcPriceFeed;
+    uint256 public totalCollateral;
+    uint256 public totalDeposits;
 
-    mapping(address => Position) public positions;
+    uint256 public OILong;
+    uint256 public OIShort;
+    uint256 public OILongInTokens;
+    uint256 public OIShortInTokens;
 
-    IERC20 public immutable i_asset;
+    mapping (address => Position) public longPositions;
+    mapping (address => Position) public shortPositions;
 
-    constructor(IERC20 _asset, address _wbtcPriceFeed) LiquidityPool(_asset) {
-        i_asset = _asset;
-        wbtcPriceFeed = _wbtcPriceFeed;
+    uint256 public maxUtilizationRatio = 5e29;
+    uint256 public maxLeverage = 20e30;
+
+
+    uint256 public constant PRECISION = 1e30;
+
+
+    constructor(address _indexToken, IERC20 _collateralToken, address _btcPriceFeed) LiquidityPool(_collateralToken) {
+        indexToken = _indexToken;
+        btcPriceFeed=_btcPriceFeed;
+
     }
 
-    // Open or modify a position
-    function openPosition(int256 _size, uint256 _collateral) external {
-        if (_size == 0) revert PerpsEngine_InvalidSize();
-        if (_collateral == 0) revert PerpsEngine_InvalidCollateral();
-
-        uint256 price = getPrice();
-        uint256 notionalValue = uint256(_size < 0 ? -_size : _size) * price / PRICE_PRECISION;
-
-        // Validate notional value and leverage
-        if (notionalValue < MIN_NOTIONAL_VALUE) {
-            revert PerpsEngine_MinNotionalValueNotMet(notionalValue, MIN_NOTIONAL_VALUE);
-        }
-        if (notionalValue > totalAssets() * MAX_POSITION_LIQUIDITY / UTILIZATION_PRECISION) {
-            revert PerpsEngine_MaxPositionLiquidityExceeded();
-        }
-        uint256 totalOpenInterest = shortsOpenInterest + (longsOpenInterestInTokens * price) / PRICE_PRECISION;
-        if (totalOpenInterest + notionalValue > totalAssets() * MAX_UTILIZATION / UTILIZATION_PRECISION) {
-            revert PerpsEngine_MaxPositionLiquidityExceeded();
-        }
-
-        uint256 leverage = notionalValue * 1e18 / _collateral;
-        if (leverage > MAX_LEVERAGE) {
-            revert PerpsEngine_MaxLeverageExceeded(leverage, MAX_LEVERAGE);
-        }
-        if (leverage < MIN_LEVERAGE) {
-            revert PerpsEngine_MinLeverageNotMet(leverage, MIN_LEVERAGE);
-        }
-
-        Position storage position = positions[msg.sender];
-
-        // Update open interest and reserved liquidity
-        if (position.size != 0) {
-            // Existing position: adjust open interest
-            if (position.size < 0) {
-                shortsOpenInterest -= uint256(-position.size) * position.entryPrice / PRICE_PRECISION;
-            } else {
-                longsOpenInterestInTokens -= uint256(position.size);
-            }
-            reservedLiquidity -= position.collateral;
-        }
-
-        // Update position
-        position.size = _size;
-        position.collateral = _collateral;
-        position.entryPrice = price;
-
-        // Update open interest
-        if (_size < 0) {
-            shortsOpenInterest += notionalValue;
-        } else {
-            longsOpenInterestInTokens += uint256(_size);
-        }
-        reservedLiquidity += _collateral;
-
-        // Transfer collateral
-        bool success = i_asset.transferFrom(msg.sender, address(this), _collateral);
-        require(success, "Collateral transfer failed");
+    function getPosition(bool isLong, address user) public view returns (Position memory) {
+        return isLong ? longPositions[user] : shortPositions[user];
     }
 
-    // Increase position size
-    function increasePositionSize(int256 _additionalSize) external {
-        if (_additionalSize == 0) revert PerpsEngine_InvalidSize();
-        Position storage position = positions[msg.sender];
-        if (position.size == 0) revert PerpsEngine_PositionNotFound();
-
-        uint256 price = getPrice();
-        uint256 notionalValue = uint256(_additionalSize < 0 ? -_additionalSize : _additionalSize) * price / PRICE_PRECISION;
-
-        // Validate liquidity constraints
-        if (notionalValue > totalAssets() * MAX_POSITION_LIQUIDITY / UTILIZATION_PRECISION) {
-            revert PerpsEngine_MaxPositionLiquidityExceeded();
+    function getNetPnL(bool isLong, uint256 indexPrice) public view returns(int256 pnl) {
+        if(isLong) {
+            pnl = int256(OILongInTokens * indexPrice) - int256(OILong);
         }
-        uint256 totalOpenInterest = shortsOpenInterest + (longsOpenInterestInTokens * price) / PRICE_PRECISION;
-        if (totalOpenInterest + notionalValue > totalAssets() * MAX_UTILIZATION / UTILIZATION_PRECISION) {
-            revert PerpsEngine_MaxPositionLiquidityExceeded();
-        }
-
-        // Ensure new size maintains leverage constraints
-        int256 newSize = position.size + _additionalSize;
-        if (newSize == 0) revert PerpsEngine_InvalidSize();
-        uint256 newNotionalValue = uint256(newSize < 0 ? -newSize : newSize) * price / PRICE_PRECISION;
-        uint256 leverage = newNotionalValue * 1e18 / position.collateral;
-        if (leverage > MAX_LEVERAGE) {
-            revert PerpsEngine_MaxLeverageExceeded(leverage, MAX_LEVERAGE);
-        }
-        if (leverage < MIN_LEVERAGE) {
-            revert PerpsEngine_MinLeverageNotMet(leverage, MIN_LEVERAGE);
-        }
-
-        // Update open interest
-        if (position.size < 0) {
-            shortsOpenInterest -= uint256(-position.size) * position.entryPrice / PRICE_PRECISION;
-        } else {
-            longsOpenInterestInTokens -= uint256(position.size);
-        }
-
-        position.size = newSize;
-        position.entryPrice = price; // Update entry price to current price
-
-        if (newSize < 0) {
-            shortsOpenInterest += newNotionalValue;
-        } else {
-            longsOpenInterestInTokens += uint256(newSize);
+        else {
+            pnl = int256(OIShort) - int256(OIShortInTokens * indexPrice); // because OIShort is most amount of money you either lose or gain
         }
     }
 
-    // Increase position collateral
-    function increasePositionCollateral(uint256 _additionalCollateral) external {
-        if (_additionalCollateral == 0) revert PerpsEngine_InvalidCollateral();
-        Position storage position = positions[msg.sender];
-        if (position.size == 0) revert PerpsEngine_PositionNotFound();
+    function totalAssets() public view override returns (uint256) {
+        uint256 _totalDeposits = totalDeposits;
+        uint256 indexPrice = getPrice();
 
-        // Update collateral and reserved liquidity
-        position.collateral += _additionalCollateral;
-        reservedLiquidity += _additionalCollateral;
+        int256 traderPnlLong = getNetPnL(true,indexPrice);
+        int256 traderPnlShort = getNetPnL(false,indexPrice);
 
-        // Transfer additional collateral
-        bool success = i_asset.transferFrom(msg.sender, address(this), _additionalCollateral);
-        require(success, "Collateral transfer failed");
+        int256 traderNetPnl = (traderPnlLong + traderPnlShort)/ int256(1e24);
+
+        if(traderNetPnl > 0) {
+            if(traderNetPnl.toUint256() > _totalDeposits ) revert("Trader PnL exceeds deposits");
+            return _totalDeposits - traderNetPnl.toUint256();
+        }
+        else return _totalDeposits + (-traderNetPnl).toUint256();
     }
 
-    // Override withdraw to check reserved liquidity
-    function withdraw(uint256 assets, address receiver, address owner) public override returns (uint256) {
-        if (assets > totalAssets() - reservedLiquidity) {
-            revert PerpsEngine_CannotWithdrawLiquidityInUse();
+
+    function increasePosition(bool isLong, uint256 sizeDelta, uint256 collateralDelta) public  {
+        if(collateralDelta > 0) IERC20(asset()).safeTransferFrom(msg.sender,address(this),collateralDelta);
+
+        mapping (address => Position) storage positions = isLong ? longPositions : shortPositions;
+        Position memory position = positions[msg.sender];
+
+        uint256 indexTokenPrice = getPrice();
+        uint256 indexTokenDelta = isLong ? sizeDelta / indexTokenPrice : Math.ceilDiv(sizeDelta,indexTokenPrice);
+
+        position.collateralAmount+=collateralDelta;
+        position.sizeInTokens+=indexTokenDelta;
+        position.sizeInUSD+=sizeDelta;
+
+        position.lastUpdatedAt = block.timestamp;
+
+        if(position.sizeInUSD == 0 || position.sizeInTokens == 0 || position.collateralAmount == 0) revert("Empty Position");
+
+        positions[msg.sender] = position;
+        totalCollateral += collateralDelta;
+        if(isLong) {
+            OILong+=sizeDelta;
+            OILongInTokens+=indexTokenDelta;
         }
-        return super.withdraw(assets, receiver, owner);
+        else {
+            OIShort+=sizeDelta;
+            OIShortInTokens+=indexTokenDelta;
+        }
+
+        _validateMaxUtil();
     }
 
-    // Override redeem to check reserved liquidity
-    function redeem(uint256 shares, address receiver, address owner) public override returns (uint256) {
-        uint256 assets = convertToAssets(shares);
-        if (assets > totalAssets() - reservedLiquidity) {
-            revert PerpsEngine_CannotWithdrawLiquidityInUse();
-        }
-        return super.redeem(shares, receiver, owner);
+    function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override {
+        super._deposit(caller, receiver, assets, shares);
+        totalDeposits += assets;
+    }
+
+    function _withdraw(address caller, address receiver, address owner, uint256 assets, uint256 shares) internal override {
+        totalDeposits -= assets;
+        super._withdraw(caller, receiver, owner, assets, shares);
+        _validateMaxUtil();
     }
 
     // Get real-time BTC price
     function getPrice() public view returns (uint256) {
-        AggregatorV3Interface priceFeed = AggregatorV3Interface(wbtcPriceFeed);
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(btcPriceFeed);
         (, int256 price, , , ) = priceFeed.latestRoundData();
         require(price > 0, "Invalid price");
-        return priceNormalised(uint256(price));
+        uint256 _decimals = uint256(priceFeed.decimals());
+        return priceNormalised(uint256(price),_decimals);
     }
 
-    // Normalize Chainlink price (8 decimals) to 18 decimals
-    function priceNormalised(uint256 price) public pure returns (uint256) {
-        return price * 1e10;
+    // Normalize Chainlink price (8 decimals) to 30 decimals
+    function priceNormalised(uint256 price, uint256 decimals) public pure returns (uint256) {
+        return price * 10 ** 14 ;
+    }
+
+    function _validateMaxUtil() internal {
+        uint256 indexTokenPrice = getPrice();
+
+        uint256 reservedShorts = OIShort;
+        uint256 reservedLongs = OILongInTokens * indexTokenPrice;
+
+        uint256 totalReserved = reservedLongs + reservedShorts;
+        uint256 valueOfDeposits = totalDeposits;
+
+        uint256 maxUtilizableValue = valueOfDeposits * maxUtilizationRatio / PRECISION ;
+
+        if(totalReserved > maxUtilizableValue) revert("Max Utilization Breached");
+
     }
 }
